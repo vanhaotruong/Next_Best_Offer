@@ -11,8 +11,8 @@ import torch.nn.functional as F
 
 # 1. Dataset Preparation
 class MovieLens25MDataset(Dataset):
-    def __init__(self, ratings_csv, num_users, num_movies):
-        df = pd.read_csv(ratings_csv)
+    def __init__(self, df, num_users, num_movies):
+        self.df = df
         self.user = torch.tensor(df['userId'].values, dtype=torch.long)
         self.movie = torch.tensor(df['movieId'].values, dtype=torch.long)
         self.rating = torch.tensor(df['rating'].values, dtype=torch.float)
@@ -23,15 +23,7 @@ class MovieLens25MDataset(Dataset):
         return len(self.user)
 
     def __getitem__(self, idx):
-        return self.user[idx], self.movie[idx], self.rating[idx]
-
-def build_graph(ratings_csv, num_users, num_movies):
-    df = pd.read_csv(ratings_csv)
-    user = torch.tensor(df['userId'].values, dtype=torch.long)
-    movie = torch.tensor(df['movieId'].values, dtype=torch.long) + num_users  # offset movie ids
-    edge_index = torch.stack([torch.cat([user, movie]), torch.cat([movie, user])], dim=0)
-    # x = torch.eye(num_users + num_movies)
-    return Data(edge_index=edge_index)
+        return self.user[idx] - 1, self.movie[idx] - 1, self.rating[idx]
 
 # 2. GCN Model
 class GCNRecommender(pl.LightningModule):
@@ -44,25 +36,28 @@ class GCNRecommender(pl.LightningModule):
         self.gcn2 = GCNConv(embedding_dim, embedding_dim)
         self.lr = lr
 
+
     def forward(self, user_ids, movie_ids, edge_index):
         num_users = self.hparams.num_users
         num_movies = self.hparams.num_movies
         x = torch.cat([self.user_emb.weight, self.movie_emb.weight], dim=0)
-        x = F.relu(self.gcn1(x, edge_index))
+        x = self.gcn1(x, edge_index)
+        x = F.relu(x)
         x = self.gcn2(x, edge_index)
         user_x = x[user_ids]
         movie_x = x[movie_ids + num_users]
         
         preds = (user_x * movie_x).sum(dim=1)
         
+
         return preds
 
     def training_step(self, batch, batch_idx):
         user, movie, rating = batch
         edge_index = self.trainer.datamodule.graph.edge_index.to(self.device)
         preds = self(user, movie, edge_index)
-        # loss = F.mse_loss(preds, rating)
-        loss = F.binary_cross_entropy_with_logits(preds, rating)
+        loss = F.mse_loss(preds, rating)
+        # loss = F.binary_cross_entropy_with_logits(preds, rating)
         self.log('train_loss', loss)
         return loss
 
@@ -73,21 +68,29 @@ class GCNRecommender(pl.LightningModule):
 class MovieLensDataModule(pl.LightningDataModule):
     def __init__(self, ratings_csv, batch_size=1024):
         super().__init__()
-        self.ratings_csv = ratings_csv
+        self.df = pd.read_csv(ratings_csv)
+        
         self.batch_size = batch_size
 
+        self.num_users = self.df['userId'].max()
+        self.num_movies = self.df['movieId'].max()
+
     def prepare_data(self):
-        df = pd.read_csv(self.ratings_csv)
-        self.num_users = df['userId'].max() + 1
-        self.num_movies = df['movieId'].max() + 1
+        pass
 
     def setup(self, stage=None):
-        self.dataset = MovieLens25MDataset(self.ratings_csv, self.num_users, self.num_movies)
-        self.graph = build_graph(self.ratings_csv, self.num_users, self.num_movies)
+        self.dataset = MovieLens25MDataset(self.df, self.num_users, self.num_movies)      
+
+        self.edge_index = torch.tensor([self.df['userId'].values - 1, 
+                                        self.df['movieId'].values - 1 + self.num_users], dtype=torch.long)
+        
+        self.edge_index = torch.cat([self.edge_index, self.edge_index.flip(0)], dim=1)
+
+        self.graph = Data(edge_index=self.edge_index)
 
     def train_dataloader(self):
         return DataLoader(self.dataset, batch_size=self.batch_size, shuffle=True)
-
+    
 # Inference: Recommend top-N movies for a given user
 def recommend_top_n(model, datamodule, user_id, top_n=10):
     model.eval()
@@ -106,17 +109,15 @@ def recommend_top_n(model, datamodule, user_id, top_n=10):
 if __name__ == "__main__":
     ratings_csv = "ml-100k/ratings.csv"  # Path to ratings.csv
     dm = MovieLensDataModule(ratings_csv)
-    dm.prepare_data()
+    
     model = GCNRecommender(dm.num_users, dm.num_movies)
 
     ckpt_path = "gcn_recommender.ckpt"
-    if os.path.exists(ckpt_path):
-        model.load_state_dict(torch.load(ckpt_path, weights_only=False)["state_dict"])
 
     trainer = pl.Trainer(max_epochs=5, accelerator="auto")
-    trainer.fit(model, datamodule=dm)
+    trainer.fit(model, datamodule=dm, ckpt_path=ckpt_path if os.path.exists(ckpt_path) else None)
 
-    trainer.save_checkpoint(ckpt_path)
+    # trainer.save_checkpoint(ckpt_path)
 
     # Example usage:
     user_id = 0  # Change as needed
