@@ -11,52 +11,14 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning import Trainer
 
 import pytorch_lightning as pl
+import random
 
 import preprocess
+from pytorch_lightning.loggers import CSVLogger
 
-# -----------------------------
-# Step 1: Dataset Preparation
-# -----------------------------
-class UserItemDataset(Dataset):
-    def __init__(self, positive_interactions_file):
-        self.positive_interactions = np.load(positive_interactions_file, allow_pickle= True)
 
-        # user_id, entity_id, entity_id:token, item_id:token, rating:float
-        self.user_ids = np.unique(self.positive_interactions[:, 0])
-        self.entity_ids = np.unique(self.positive_interactions[:, 1])
-        
-        self.n_user = len(self.user_ids)
-        self.n_entity = len(self.entity_ids)
-
-    def __len__(self):
-        return len(self.positive_interactions)
-
-    def __getitem__(self, idx):
-        # user_id, entity_id, entity_id:token, item_id:token, rating:float
-        user_id, entity_id, _, _, label = self.positive_interactions[idx]
-        return torch.tensor(user_id, dtype=torch.long), \
-                torch.tensor(entity_id, dtype=torch.long), \
-                torch.tensor(label, dtype=torch.long)
-    
-    def sample_negative_items(self):
-        # Build positive interaction dictionary
-        self.positive_dict = defaultdict(set)
-        for user, item, _ in self.positive_interactions:
-            self.positive_dict[user].add(item)
-
-        # Build negative interaction dictionary
-        self.negative_dict = defaultdict(list)
-
-        for user_id in self.users:
-            user_neg_items = []
-
-            while len(user_neg_items) < 10:
-                candidates = np.random.choice(self.items, size=10 - len(user_neg_items), replace=True)
-                for item in candidates:
-                    if item not in self.positive_dict[user_id] and item not in user_neg_items:
-                        user_neg_items.append(item)
-
-            self.negative_dict[user_id] = user_neg_items
+import pandas as pd
+import matplotlib.pyplot as plt
 
 class KnownledgeGraph():
     def __init__(self, graph_file, nbr_sample_size = 5):
@@ -129,17 +91,18 @@ class SumAggregator(nn.Module):
         combined = agg_neighbors + central_emb  # shape: (D,)
 
         # Apply trainable transformation and activation
-        output = torch.relu(self.linear(combined))  # shape: (D,)
+        output = torch.sigmoid(self.linear(combined))  # shape: (D,)
         return output
 
 class KGCN(pl.LightningModule):
-    def __init__(self, n_user, graph: KnownledgeGraph,  hop= 2, embedding_dim=64, lr=0.01, lambda_reg=1e-4): #interactions: UserItemInteractions,
+    def __init__(self, user_entity_dict: defaultdict, graph: KnownledgeGraph,  hop= 2, embedding_dim=64, lr=0.1, lambda_reg=1e-4): #interactions: UserItemInteractions,
         super().__init__()
         self.save_hyperparameters()
 
-        self.n_user = n_user
+        self.user_entity_dict = user_entity_dict
+        n_user = len(self.user_entity_dict)
 
-        self.user_embedding = nn.Embedding(self.n_user, embedding_dim)
+        self.user_embedding = nn.Embedding(n_user, embedding_dim)
         self.entity_embedding = nn.Embedding(graph.graph_n_entity, embedding_dim)
         self.relation_embedding = nn.Embedding(graph.graph_n_relation, embedding_dim)
 
@@ -161,92 +124,93 @@ class KGCN(pl.LightningModule):
         return M
 
     def forward(self, user_ids, entity_ids):
-        user_embs = self.user_embedding(user_ids) # shape (batch_size, embedding_dim)
-        # entity_embs = self.entity_embedding(entity_ids) # shape (batch_size, embedding_dim)
+        user_embs = self.user_embedding(user_ids)  # shape: (batch_size, embedding_dim)
+        # entity_embs = self.entity_embedding(entity_ids)
 
         batch_entity_embs = []
-
         for user_id, entity_id in zip(user_ids, entity_ids):
-            user_emb = self.user_embedding(user_id) # shape (embedding_dim)
-            
+            user_emb = self.user_embedding(user_id)  # shape: (embedding_dim)
+
             # Get multi-hop receptive field
             M = self._get_receptive_field(entity_id, H=self.hop)
-            # hop_0_entitie_embs = self.entity_embedding(torch.tensor(M[0], dtype=torch.long))
+            e_u = {0: {e: self.entity_embedding(e) for e in M[0]}}  # hop 0 embeddings
 
-            e_u = {0: {e: self.entity_embedding(e) for e in M[0]}} # dictionary of a dictionary
             for h in range(1, self.hop + 1):
                 e_u[h] = {}
                 for hop_h_e in M[h]:
-                    hop_h_e_emb = self.entity_embedding(hop_h_e) # shape (embedding_dim)
-                    
-                    adj_entities, adj_relations = graph.compute_adjentities_adjrelations(hop_h_e, graph.graph_nbr_sample_size)
-                    # adj_entities: shape (knowledge graph nbr_sample_size)
-                    # adj_relations: shape (knowledge graph nbr_sample_size)
+                    hop_h_e_emb = self.entity_embedding(hop_h_e)
 
-                    hop_h_e_adj_entities_embs = self.entity_embedding(adj_entities.detach().clone())
-                    self.relation_embedding(adj_relations.detach().clone())
-                    # hop_h_e_adj_entities_embs: shape (knowledge graph nbr_sample_size, embedding_dim)
-                    hop_h_e_adj_relation_embs = self.relation_embedding(adj_relations.detach().clone())
-                    # hop_h_e_adj_relation_embs: shape (knowledge graph nbr_sample_size, embedding_dim)
+                    # Get adjacent entities and relations
+                    adj_entities, adj_relations = graph.compute_adjentities_adjrelations(
+                        hop_h_e, graph.graph_nbr_sample_size
+                    )
+                    # Remove .detach().clone() to keep gradients
+                    hop_h_e_adj_entities_embs = self.entity_embedding(adj_entities)
+                    hop_h_e_adj_relation_embs = self.relation_embedding(adj_relations)
+                    # Attention weights
+                    user_relations_dot_products = torch.matmul(hop_h_e_adj_relation_embs, user_emb)
+                    user_relations_dot_products = F.softmax(user_relations_dot_products, dim=0)
+                    user_relations_dot_products = user_relations_dot_products.unsqueeze(1)
 
-                    user_relations_dot_products = torch.matmul(hop_h_e_adj_relation_embs, user_emb) # shape (knowledge graph nbr_sample_size) 
-                    user_relations_dot_products = F.softmax(user_relations_dot_products, dim= 0)  # shape (knowledge graph nbr_sample_size)
-                    user_relations_dot_products = user_relations_dot_products.unsqueeze(1) # shape (knowledge graph nbr_sample_size, 1)
-                    
+                    # Weighted sum of neighbor embeddings
                     neighborhood_representation_embs = hop_h_e_adj_entities_embs * user_relations_dot_products
-                    # neighborhood_representation_embs: shape (knowledge graph nbr_sample_size, embedding_dim)
-                    e_u[h][hop_h_e] = self.sum_agg(neighborhood_representation_embs, 
-                                                   hop_h_e_emb)
 
-            entity_emb_list = list(e_u[self.hop].values())      # e_u[self.hop] only has 1 dict {'entity_id': embedding value}
-                                                                #'entity_id' in e_u[self.hop] is the central entity v in paper     
-                                                                # .value() here is to get the embeding value of the central entity v           
+                    # Aggregate
+                    e_u[h][hop_h_e] = self.sum_agg(neighborhood_representation_embs, hop_h_e_emb)
+            # Get final entity embedding (central entity v)
+            entity_emb_list = list(e_u[self.hop].values())
+            entity_emb = entity_emb_list[0]
+            batch_entity_embs.append(entity_emb)
+        entity_embs = torch.stack(batch_entity_embs, dim=0)  # shape: (batch_size, embedding_dim)
 
-            entity_emb = entity_emb_list[0]     # [0] because only has 1 value in the list
-                                                # shape (embedding_dim)
+        # Final score
+        scores = torch.mean(user_embs * entity_embs, dim=1)
 
-            batch_entity_embs.append(entity_emb)    # list, len() = batch_size
-
-        entity_embs = torch.stack(batch_entity_embs, dim= 0)    # shape (batch_size, embedding_dim)
-        scores = torch.mean(user_embs * entity_embs, dim=1) 
-        return  scores #torch.sigmoid(scores)        
+        return scores  # Use torch.sigmoid(scores) if not using BCEWithLogitsLoss
     
-    def compute_loss(self, user_ids, pos_entity_ids):#, neg_entity_ids):
-        # Positive predictions
-        preds = self(user_ids, pos_entity_ids)    # shape (batch_size)
-        loss = self.loss_fn(preds,        # single value
-                            torch.ones_like(preds)) # torch.ones_like = tensor(1, 1, ...., 1)
-                                                                      # has len() = len(pos_preds) 
+    def compute_loss_acc(self, user_ids, entity_ids, labels):
+        # Forward pass to get predictions
+        preds = self(user_ids, entity_ids)  # shape: (batch_size)
 
-        # # Negative predictions
-        # neg_preds = self(user_ids, neg_item_ids)
-        # neg_loss = F.binary_cross_entropy(neg_preds, torch.zeros_like(neg_preds))
+        # Compute loss
+        loss = self.loss_fn(preds, labels)
 
-        # Interaction loss
-        # interaction_loss = pos_loss #- neg_loss
+        # Compute accuracy
+        predicted = (preds > 0.5).float()  # Convert logits to binary predictions
+        correct = (predicted == labels).float()
+        acc = correct.sum() / len(labels)
 
-        # Total loss
-        return preds, loss
+        return preds, loss, acc
 
     def training_step(self, batch, batch_idx):
         user_ids, item_ids, labels = batch
-        preds, loss = self.compute_loss(user_ids, item_ids)
-        self.log("train_loss", loss)
+        preds, loss, acc = self.compute_loss_acc(user_ids, item_ids, labels)
+
+        self.log("train_loss", loss, on_epoch=True)
+        self.log("train_acc", acc, on_epoch=True, prog_bar= True)
+
         return loss
-    
-    
+   
+   
+    def on_after_backward(self):
+        # Example: log gradient norm of user_embedding
+        grad_norm_1 = self.user_embedding.weight.grad.norm().item()
+        grad_norm_2 = self.entity_embedding.weight.grad.norm().item() 
+        # grad_norm_3 = self.relation_embedding.weight.grad.norm().item()
+        self.log("user", grad_norm_1, prog_bar=True)
+        self.log("entity", grad_norm_2, prog_bar=True)
+        # self.log("relation", grad_norm_3, prog_bar=True)
+
     def validation_step(self, batch, batch_idx):
         user_ids, item_ids, labels = batch
-        preds, loss = self.compute_loss(user_ids, item_ids)
-        self.log("val_loss", loss)
-
-        predicted = (preds > 0.5).float()
-        acc = (predicted == labels).float().mean()
-        self.log("val_acc", acc)
+        preds, loss, acc = self.compute_loss_acc(user_ids, item_ids, labels)
+ 
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True)
+        self.log("val_acc", acc, on_epoch=True, prog_bar=True)
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr, 
-                                weight_decay=self.hparams.lambda_reg)
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr), 
+                                # weight_decay=self.hparams.lambda_reg)
 
 # -----------------------------
 # Step 3: Training
@@ -255,13 +219,52 @@ class KGCN(pl.LightningModule):
 if __name__ == '__main__':
     # preprocess.compute()
 
-    positive_interactions_dataset = UserItemDataset('./data/processed_interactions.npy')
-    n_user = positive_interactions_dataset.n_user
+    # Load interaction data
+    interactions = np.load('./data/processed_interactions.npy', allow_pickle=True)
+    all_user_ids = np.unique(interactions[:, 0])
+    all_entity_ids = np.unique(interactions[:, 1])
+
+    # Create positive dataset: (user, item, label)
+    positive_dataset = [(u, i, 1.0) for (u, i, _, _, _) in interactions]
+
+    # Build user-item interaction dictionary
+    user_entity_pos_dict = defaultdict(set)
+    for u, i, _,  in positive_dataset:
+        user_entity_pos_dict[u].add(i)
+
+    # Negative sampling
+    negative_dataset = []
+    for user_id in all_user_ids:
+        interacted_items = user_entity_pos_dict[user_id]
+        non_interacted_items = list(set(all_entity_ids) - interacted_items)
+
+        # Sample negatives equal to number of positives for that user
+        k = min(len(interacted_items), len(non_interacted_items))
+        sampled_negatives = random.sample(non_interacted_items, k=k)
+
+        negative_dataset.extend([(user_id, item_id, 0.0) for item_id in sampled_negatives])
+
+    # Build user-item negative interaction dictionary
+    user_entity_neg_dict = defaultdict(set)
+    for u, i, _ in negative_dataset:
+        user_entity_neg_dict[u].add(i)
+
+    # Final dataset structure
+    user_entity_dict = {
+        u: {
+            'pos': user_entity_pos_dict[u],
+            'neg': user_entity_neg_dict[u]
+        }
+        for u in all_user_ids
+    }
+
+    dataset = positive_dataset + negative_dataset
+    random.shuffle(dataset)
 
     # Split the dataset
-    TRAIN_SIZE = 0.4
+    TRAIN_SIZE = 0.7
     TEST_SIZE = 1 - TRAIN_SIZE
-    train_dataset, test_dataset = random_split(positive_interactions_dataset, [TRAIN_SIZE, TEST_SIZE])
+    train_dataset, test_dataset = random_split(dataset, [TRAIN_SIZE, TEST_SIZE])
 
     # Create DataLoaders
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=13, persistent_workers= True)
@@ -270,7 +273,8 @@ if __name__ == '__main__':
     graph = KnownledgeGraph('./data/processed_graph.npy')
     graph.build()
 
-    model = KGCN(n_user, graph)
+    model = KGCN(user_entity_dict, graph= graph)
+    csv_logger = CSVLogger("logs", name="kgcn")
 
     checkpoint_callback = ModelCheckpoint(
             monitor="val_loss",
@@ -281,12 +285,31 @@ if __name__ == '__main__':
         )
 
     trainer = Trainer(
+            num_sanity_val_steps=0,
             max_epochs=10,
             accelerator="auto",
             callbacks=[checkpoint_callback],
-            log_every_n_steps=10,
-            # precision='bf16'
+            # log_every_n_steps=10,
+            logger=csv_logger
         )
 
-
     trainer.fit(model, train_loader, test_loader)
+
+    ##### plot
+    
+    df = pd.read_csv("logs/kgcn/version_0/metrics.csv")
+
+    # Group by epoch and compute mean
+    metrics = df.groupby("epoch").mean()
+
+    # Plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(metrics["train_loss"], label="Training Loss")
+    plt.plot(metrics["val_loss"], label="Validation Loss")
+    plt.plot(metrics["train_acc"], label="Training Accuracy")
+    plt.plot(metrics["val_acc"], label="Validation Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Value")
+    plt.title("Training and Validation Metrics per Epoch")
+    plt.legend()
+
